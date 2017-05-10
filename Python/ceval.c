@@ -37,7 +37,6 @@ typedef PyObject *(*callproc)(PyObject *, PyObject *, PyObject *);
 
 /* Forward declarations */
 Py_LOCAL_INLINE(PyObject *) call_function(PyObject ***, Py_ssize_t, PyObject *);
-static PyObject * fast_function(PyObject *, PyObject **, Py_ssize_t, PyObject *);
 static PyObject * do_call_core(PyObject *, PyObject *, PyObject *);
 
 #ifdef LLTRACE
@@ -149,7 +148,7 @@ static long dxp[256];
 #include "pythread.h"
 
 static PyThread_type_lock pending_lock = 0; /* for pending calls */
-static long main_thread = 0;
+static unsigned long main_thread = 0;
 /* This single variable consolidates all requests to break out of the fast path
    in the eval loop. */
 static _Py_atomic_int eval_breaker = {0};
@@ -1355,9 +1354,15 @@ _PyEval_EvalFrameDefault(PyFrameObject *f, int throwflag)
         TARGET(BINARY_MODULO) {
             PyObject *divisor = POP();
             PyObject *dividend = TOP();
-            PyObject *res = PyUnicode_CheckExact(dividend) ?
-                PyUnicode_Format(dividend, divisor) :
-                PyNumber_Remainder(dividend, divisor);
+            PyObject *res;
+            if (PyUnicode_CheckExact(dividend) && (
+                  !PyUnicode_Check(divisor) || PyUnicode_CheckExact(divisor))) {
+              // fast path; string formatting, but not if the RHS is a str subclass
+              // (see issue28598)
+              res = PyUnicode_Format(dividend, divisor);
+            } else {
+              res = PyNumber_Remainder(dividend, divisor);
+            }
             Py_DECREF(divisor);
             Py_DECREF(dividend);
             SET_TOP(res);
@@ -1850,13 +1855,13 @@ _PyEval_EvalFrameDefault(PyFrameObject *f, int throwflag)
 
             awaitable = _PyCoro_GetAwaitableIter(iter);
             if (awaitable == NULL) {
-                SET_TOP(NULL);
-                PyErr_Format(
+                _PyErr_FormatFromCause(
                     PyExc_TypeError,
                     "'async for' received an invalid object "
                     "from __aiter__: %.100s",
                     Py_TYPE(iter)->tp_name);
 
+                SET_TOP(NULL);
                 Py_DECREF(iter);
                 goto error;
             } else {
@@ -1915,7 +1920,7 @@ _PyEval_EvalFrameDefault(PyFrameObject *f, int throwflag)
 
                 awaitable = _PyCoro_GetAwaitableIter(next_iter);
                 if (awaitable == NULL) {
-                    PyErr_Format(
+                    _PyErr_FormatFromCause(
                         PyExc_TypeError,
                         "'async for' received an invalid object "
                         "from __anext__: %.100s",
@@ -2805,13 +2810,16 @@ _PyEval_EvalFrameDefault(PyFrameObject *f, int throwflag)
         TARGET(IMPORT_STAR) {
             PyObject *from = POP(), *locals;
             int err;
-            if (PyFrame_FastToLocalsWithError(f) < 0)
+            if (PyFrame_FastToLocalsWithError(f) < 0) {
+                Py_DECREF(from);
                 goto error;
+            }
 
             locals = f->f_locals;
             if (locals == NULL) {
                 PyErr_SetString(PyExc_SystemError,
                     "no locals found during 'import *'");
+                Py_DECREF(from);
                 goto error;
             }
             err = import_all_from(locals, from);
@@ -3895,7 +3903,7 @@ too_many_positional(PyCodeObject *co, Py_ssize_t given, Py_ssize_t defcount,
    PyEval_EvalFrame() and PyEval_EvalCodeEx() you will need to adjust
    the test in the if statements in Misc/gdbinit (pystack and pystackv). */
 
-static PyObject *
+PyObject *
 _PyEval_EvalCodeWithName(PyObject *_co, PyObject *globals, PyObject *locals,
            PyObject **args, Py_ssize_t argcount,
            PyObject **kwnames, PyObject **kwargs,
@@ -4732,39 +4740,6 @@ PyEval_MergeCompilerFlags(PyCompilerFlags *cf)
 }
 
 
-/* External interface to call any callable object.
-   The arg must be a tuple or NULL.  The kw must be a dict or NULL. */
-
-PyObject *
-PyEval_CallObjectWithKeywords(PyObject *callable,
-                              PyObject *args, PyObject *kwargs)
-{
-#ifdef Py_DEBUG
-    /* PyEval_CallObjectWithKeywords() must not be called with an exception
-       set. It raises a new exception if parameters are invalid or if
-       PyTuple_New() fails, and so the original exception is lost. */
-    assert(!PyErr_Occurred());
-#endif
-
-    if (args == NULL) {
-        return _PyObject_FastCallDict(callable, NULL, 0, kwargs);
-    }
-
-    if (!PyTuple_Check(args)) {
-        PyErr_SetString(PyExc_TypeError,
-                        "argument list must be a tuple");
-        return NULL;
-    }
-
-    if (kwargs != NULL && !PyDict_Check(kwargs)) {
-        PyErr_SetString(PyExc_TypeError,
-                        "keyword list must be a dictionary");
-        return NULL;
-    }
-
-    return PyObject_Call(callable, args, kwargs);
-}
-
 const char *
 PyEval_GetFuncName(PyObject *func)
 {
@@ -4843,7 +4818,20 @@ call_function(PyObject ***pp_stack, Py_ssize_t oparg, PyObject *kwnames)
     }
     else if (Py_TYPE(func) == &PyMethodDescr_Type) {
         PyThreadState *tstate = PyThreadState_GET();
-        C_TRACE(x, _PyMethodDescr_FastCallKeywords(func, stack, nargs, kwnames));
+        if (tstate->use_tracing && tstate->c_profilefunc) {
+            // We need to create PyCFunctionObject for tracing.
+            PyMethodDescrObject *descr = (PyMethodDescrObject*)func;
+            func = PyCFunction_NewEx(descr->d_method, stack[0], NULL);
+            if (func == NULL) {
+                return NULL;
+            }
+            C_TRACE(x, _PyCFunction_FastCallKeywords(func, stack+1, nargs-1,
+                                                     kwnames));
+            Py_DECREF(func);
+        }
+        else {
+            x = _PyMethodDescr_FastCallKeywords(func, stack, nargs, kwnames);
+        }
     }
     else {
         if (PyMethod_Check(func) && PyMethod_GET_SELF(func) != NULL) {
@@ -4865,7 +4853,7 @@ call_function(PyObject ***pp_stack, Py_ssize_t oparg, PyObject *kwnames)
         }
 
         if (PyFunction_Check(func)) {
-            x = fast_function(func, stack, nargs, kwnames);
+            x = _PyFunction_FastCallKeywords(func, stack, nargs, kwnames);
         }
         else {
             x = _PyObject_FastCallKeywords(func, stack, nargs, kwnames);
@@ -4875,215 +4863,13 @@ call_function(PyObject ***pp_stack, Py_ssize_t oparg, PyObject *kwnames)
 
     assert((x != NULL) ^ (PyErr_Occurred() != NULL));
 
-    /* Clear the stack of the function object.  Also removes
-       the arguments in case they weren't consumed already
-       (fast_function() and err_args() leave them on the stack).
-     */
+    /* Clear the stack of the function object. */
     while ((*pp_stack) > pfunc) {
         w = EXT_POP(*pp_stack);
         Py_DECREF(w);
     }
 
     return x;
-}
-
-/* The fast_function() function optimize calls for which no argument
-   tuple is necessary; the objects are passed directly from the stack.
-   For the simplest case -- a function that takes only positional
-   arguments and is called with only positional arguments -- it
-   inlines the most primitive frame setup code from
-   PyEval_EvalCodeEx(), which vastly reduces the checks that must be
-   done before evaluating the frame.
-*/
-
-static PyObject* _Py_HOT_FUNCTION
-_PyFunction_FastCall(PyCodeObject *co, PyObject **args, Py_ssize_t nargs,
-                     PyObject *globals)
-{
-    PyFrameObject *f;
-    PyThreadState *tstate = PyThreadState_GET();
-    PyObject **fastlocals;
-    Py_ssize_t i;
-    PyObject *result;
-
-    assert(globals != NULL);
-    /* XXX Perhaps we should create a specialized
-       _PyFrame_New_NoTrack() that doesn't take locals, but does
-       take builtins without sanity checking them.
-       */
-    assert(tstate != NULL);
-    f = _PyFrame_New_NoTrack(tstate, co, globals, NULL);
-    if (f == NULL) {
-        return NULL;
-    }
-
-    fastlocals = f->f_localsplus;
-
-    for (i = 0; i < nargs; i++) {
-        Py_INCREF(*args);
-        fastlocals[i] = *args++;
-    }
-    result = PyEval_EvalFrameEx(f,0);
-
-    if (Py_REFCNT(f) > 1) {
-        Py_DECREF(f);
-        _PyObject_GC_TRACK(f);
-    }
-    else {
-        ++tstate->recursion_depth;
-        Py_DECREF(f);
-        --tstate->recursion_depth;
-    }
-    return result;
-}
-
-static PyObject *
-fast_function(PyObject *func, PyObject **stack,
-              Py_ssize_t nargs, PyObject *kwnames)
-{
-    PyCodeObject *co = (PyCodeObject *)PyFunction_GET_CODE(func);
-    PyObject *globals = PyFunction_GET_GLOBALS(func);
-    PyObject *argdefs = PyFunction_GET_DEFAULTS(func);
-    PyObject *kwdefs, *closure, *name, *qualname;
-    PyObject **d;
-    Py_ssize_t nkwargs = (kwnames == NULL) ? 0 : PyTuple_GET_SIZE(kwnames);
-    Py_ssize_t nd;
-
-    assert(PyFunction_Check(func));
-    assert(nargs >= 0);
-    assert(kwnames == NULL || PyTuple_CheckExact(kwnames));
-    assert((nargs == 0 && nkwargs == 0) || stack != NULL);
-    /* kwnames must only contains str strings, no subclass, and all keys must
-       be unique */
-
-    if (co->co_kwonlyargcount == 0 && nkwargs == 0 &&
-        co->co_flags == (CO_OPTIMIZED | CO_NEWLOCALS | CO_NOFREE))
-    {
-        if (argdefs == NULL && co->co_argcount == nargs) {
-            return _PyFunction_FastCall(co, stack, nargs, globals);
-        }
-        else if (nargs == 0 && argdefs != NULL
-                 && co->co_argcount == Py_SIZE(argdefs)) {
-            /* function called with no arguments, but all parameters have
-               a default value: use default values as arguments .*/
-            stack = &PyTuple_GET_ITEM(argdefs, 0);
-            return _PyFunction_FastCall(co, stack, Py_SIZE(argdefs), globals);
-        }
-    }
-
-    kwdefs = PyFunction_GET_KW_DEFAULTS(func);
-    closure = PyFunction_GET_CLOSURE(func);
-    name = ((PyFunctionObject *)func) -> func_name;
-    qualname = ((PyFunctionObject *)func) -> func_qualname;
-
-    if (argdefs != NULL) {
-        d = &PyTuple_GET_ITEM(argdefs, 0);
-        nd = Py_SIZE(argdefs);
-    }
-    else {
-        d = NULL;
-        nd = 0;
-    }
-    return _PyEval_EvalCodeWithName((PyObject*)co, globals, (PyObject *)NULL,
-                                    stack, nargs,
-                                    nkwargs ? &PyTuple_GET_ITEM(kwnames, 0) : NULL,
-                                    stack + nargs,
-                                    nkwargs, 1,
-                                    d, (int)nd, kwdefs,
-                                    closure, name, qualname);
-}
-
-PyObject *
-_PyFunction_FastCallKeywords(PyObject *func, PyObject **stack,
-                             Py_ssize_t nargs, PyObject *kwnames)
-{
-    return fast_function(func, stack, nargs, kwnames);
-}
-
-PyObject *
-_PyFunction_FastCallDict(PyObject *func, PyObject **args, Py_ssize_t nargs,
-                         PyObject *kwargs)
-{
-    PyCodeObject *co = (PyCodeObject *)PyFunction_GET_CODE(func);
-    PyObject *globals = PyFunction_GET_GLOBALS(func);
-    PyObject *argdefs = PyFunction_GET_DEFAULTS(func);
-    PyObject *kwdefs, *closure, *name, *qualname;
-    PyObject *kwtuple, **k;
-    PyObject **d;
-    Py_ssize_t nd, nk;
-    PyObject *result;
-
-    assert(func != NULL);
-    assert(nargs >= 0);
-    assert(nargs == 0 || args != NULL);
-    assert(kwargs == NULL || PyDict_Check(kwargs));
-
-    if (co->co_kwonlyargcount == 0 &&
-        (kwargs == NULL || PyDict_GET_SIZE(kwargs) == 0) &&
-        co->co_flags == (CO_OPTIMIZED | CO_NEWLOCALS | CO_NOFREE))
-    {
-        /* Fast paths */
-        if (argdefs == NULL && co->co_argcount == nargs) {
-            return _PyFunction_FastCall(co, args, nargs, globals);
-        }
-        else if (nargs == 0 && argdefs != NULL
-                 && co->co_argcount == Py_SIZE(argdefs)) {
-            /* function called with no arguments, but all parameters have
-               a default value: use default values as arguments .*/
-            args = &PyTuple_GET_ITEM(argdefs, 0);
-            return _PyFunction_FastCall(co, args, Py_SIZE(argdefs), globals);
-        }
-    }
-
-    nk = (kwargs != NULL) ? PyDict_GET_SIZE(kwargs) : 0;
-    if (nk != 0) {
-        Py_ssize_t pos, i;
-
-        /* Issue #29318: Caller and callee functions must not share the
-           dictionary: kwargs must be copied. */
-        kwtuple = PyTuple_New(2 * nk);
-        if (kwtuple == NULL) {
-            return NULL;
-        }
-
-        k = &PyTuple_GET_ITEM(kwtuple, 0);
-        pos = i = 0;
-        while (PyDict_Next(kwargs, &pos, &k[i], &k[i+1])) {
-            /* We must hold strong references because keyword arguments can be
-               indirectly modified while the function is called:
-               see issue #2016 and test_extcall */
-            Py_INCREF(k[i]);
-            Py_INCREF(k[i+1]);
-            i += 2;
-        }
-        nk = i / 2;
-    }
-    else {
-        kwtuple = NULL;
-        k = NULL;
-    }
-
-    kwdefs = PyFunction_GET_KW_DEFAULTS(func);
-    closure = PyFunction_GET_CLOSURE(func);
-    name = ((PyFunctionObject *)func) -> func_name;
-    qualname = ((PyFunctionObject *)func) -> func_qualname;
-
-    if (argdefs != NULL) {
-        d = &PyTuple_GET_ITEM(argdefs, 0);
-        nd = Py_SIZE(argdefs);
-    }
-    else {
-        d = NULL;
-        nd = 0;
-    }
-
-    result = _PyEval_EvalCodeWithName((PyObject*)co, globals, (PyObject *)NULL,
-                                      args, nargs,
-                                      k, k + 1, nk, 2,
-                                      d, nd, kwdefs,
-                                      closure, name, qualname);
-    Py_XDECREF(kwtuple);
-    return result;
 }
 
 static PyObject *
@@ -5103,17 +4889,13 @@ do_call_core(PyObject *func, PyObject *callargs, PyObject *kwdict)
 /* Extract a slice index from a PyLong or an object with the
    nb_index slot defined, and store in *pi.
    Silently reduce values larger than PY_SSIZE_T_MAX to PY_SSIZE_T_MAX,
-   and silently boost values less than -PY_SSIZE_T_MAX-1 to -PY_SSIZE_T_MAX-1.
+   and silently boost values less than PY_SSIZE_T_MIN to PY_SSIZE_T_MIN.
    Return 0 on error, 1 on success.
-*/
-/* Note:  If v is NULL, return success without storing into *pi.  This
-   is because_PyEval_SliceIndex() is called by apply_slice(), which can be
-   called by the SLICE opcode with v and/or w equal to NULL.
 */
 int
 _PyEval_SliceIndex(PyObject *v, Py_ssize_t *pi)
 {
-    if (v != NULL) {
+    if (v != Py_None) {
         Py_ssize_t x;
         if (PyIndex_Check(v)) {
             x = PyNumber_AsSsize_t(v, NULL);
@@ -5130,6 +4912,26 @@ _PyEval_SliceIndex(PyObject *v, Py_ssize_t *pi)
     }
     return 1;
 }
+
+int
+_PyEval_SliceIndexNotNone(PyObject *v, Py_ssize_t *pi)
+{
+    Py_ssize_t x;
+    if (PyIndex_Check(v)) {
+        x = PyNumber_AsSsize_t(v, NULL);
+        if (x == -1 && PyErr_Occurred())
+            return 0;
+    }
+    else {
+        PyErr_SetString(PyExc_TypeError,
+                        "slice indices must be integers or "
+                        "have an __index__ method");
+        return 0;
+    }
+    *pi = x;
+    return 1;
+}
+
 
 #define CANNOT_CATCH_MSG "catching classes that do not inherit from "\
                          "BaseException is not allowed"
@@ -5231,7 +5033,7 @@ import_from(PyObject *v, PyObject *name)
 {
     PyObject *x;
     _Py_IDENTIFIER(__name__);
-    PyObject *fullmodname, *pkgname;
+    PyObject *fullmodname, *pkgname, *pkgpath, *pkgname_or_unknown, *errmsg;
 
     x = PyObject_GetAttr(v, name);
     if (x != NULL || !PyErr_ExceptionMatches(PyExc_AttributeError))
@@ -5245,8 +5047,8 @@ import_from(PyObject *v, PyObject *name)
         goto error;
     }
     fullmodname = PyUnicode_FromFormat("%U.%U", pkgname, name);
-    Py_DECREF(pkgname);
     if (fullmodname == NULL) {
+        Py_DECREF(pkgname);
         return NULL;
     }
     x = PyDict_GetItem(PyImport_GetModuleDict(), fullmodname);
@@ -5254,10 +5056,42 @@ import_from(PyObject *v, PyObject *name)
     if (x == NULL) {
         goto error;
     }
+    Py_DECREF(pkgname);
     Py_INCREF(x);
     return x;
  error:
-    PyErr_Format(PyExc_ImportError, "cannot import name %R", name);
+    pkgpath = PyModule_GetFilenameObject(v);
+    if (pkgname == NULL) {
+        pkgname_or_unknown = PyUnicode_FromString("<unknown module name>");
+        if (pkgname_or_unknown == NULL) {
+            Py_XDECREF(pkgpath);
+            return NULL;
+        }
+    } else {
+        pkgname_or_unknown = pkgname;
+    }
+
+    if (pkgpath == NULL || !PyUnicode_Check(pkgpath)) {
+        PyErr_Clear();
+        errmsg = PyUnicode_FromFormat(
+            "cannot import name %R from %R (unknown location)",
+            name, pkgname_or_unknown
+        );
+        /* NULL check for errmsg done by PyErr_SetImportError. */
+        PyErr_SetImportError(errmsg, pkgname, NULL);
+    }
+    else {
+        errmsg = PyUnicode_FromFormat(
+            "cannot import name %R from %R (%S)",
+            name, pkgname_or_unknown, pkgpath
+        );
+        /* NULL check for errmsg done by PyErr_SetImportError. */
+        PyErr_SetImportError(errmsg, pkgname, pkgpath);
+    }
+
+    Py_XDECREF(errmsg);
+    Py_XDECREF(pkgname_or_unknown);
+    Py_XDECREF(pkgpath);
     return NULL;
 }
 

@@ -437,7 +437,7 @@ static PyObject *empty_values[1] = { NULL };
 /* #define DEBUG_PYDICT */
 
 
-#ifdef Py_DEBUG
+#ifndef NDEBUG
 static int
 _PyDict_CheckConsistency(PyDictObject *mp)
 {
@@ -677,7 +677,8 @@ Christian Tismer.
 lookdict() is general-purpose, and may return DKIX_ERROR if (and only if) a
 comparison raises an exception.
 lookdict_unicode() below is specialized to string keys, comparison of which can
-never raise an exception; that function can never return DKIX_ERROR.
+never raise an exception; that function can never return DKIX_ERROR when key
+is string.  Otherwise, it falls back to lookdict().
 lookdict_unicode_nodummy is further specialized for string keys that cannot be
 the <dummy> value.
 For both, when the key isn't found a DKIX_EMPTY is returned. hashpos returns
@@ -1914,7 +1915,7 @@ _PyDict_FromKeys(PyObject *cls, PyObject *iterable, PyObject *value)
             PyObject *key;
             Py_hash_t hash;
 
-            if (dictresize(mp, ESTIMATE_SIZE(Py_SIZE(iterable)))) {
+            if (dictresize(mp, ESTIMATE_SIZE(PyDict_GET_SIZE(iterable)))) {
                 Py_DECREF(d);
                 return NULL;
             }
@@ -4352,15 +4353,19 @@ _PyObjectDict_SetItem(PyTypeObject *tp, PyObject **dictptr,
         }
         if (value == NULL) {
             res = PyDict_DelItem(dict, key);
-            if (cached != ((PyDictObject *)dict)->ma_keys) {
+            // Since key sharing dict doesn't allow deletion, PyDict_DelItem()
+            // always converts dict to combined form.
+            if ((cached = CACHED_KEYS(tp)) != NULL) {
                 CACHED_KEYS(tp) = NULL;
                 DK_DECREF(cached);
             }
         }
         else {
-            int was_shared = cached == ((PyDictObject *)dict)->ma_keys;
+            int was_shared = (cached == ((PyDictObject *)dict)->ma_keys);
             res = PyDict_SetItem(dict, key, value);
-            if (was_shared && cached != ((PyDictObject *)dict)->ma_keys) {
+            if (was_shared &&
+                    (cached = CACHED_KEYS(tp)) != NULL &&
+                    cached != ((PyDictObject *)dict)->ma_keys) {
                 /* PyDict_SetItem() may call dictresize and convert split table
                  * into combined table.  In such case, convert it to split
                  * table again and update type's shared key only when this is

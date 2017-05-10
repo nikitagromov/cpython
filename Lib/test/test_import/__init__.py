@@ -80,6 +80,34 @@ class ImportTests(unittest.TestCase):
         with self.assertRaises(ImportError):
             from importlib import something_that_should_not_exist_anywhere
 
+    def test_from_import_missing_attr_has_name_and_path(self):
+        with self.assertRaises(ImportError) as cm:
+            from os import i_dont_exist
+        self.assertEqual(cm.exception.name, 'os')
+        self.assertEqual(cm.exception.path, os.__file__)
+        self.assertRegex(str(cm.exception), r"cannot import name 'i_dont_exist' from 'os' \(.*os.py\)")
+
+    def test_from_import_missing_attr_has_name_and_so_path(self):
+        import select
+        with self.assertRaises(ImportError) as cm:
+            from select import i_dont_exist
+        self.assertEqual(cm.exception.name, 'select')
+        self.assertEqual(cm.exception.path, select.__file__)
+        self.assertRegex(str(cm.exception), r"cannot import name 'i_dont_exist' from 'select' \(.*\.(so|pyd)\)")
+
+    def test_from_import_missing_attr_has_name(self):
+        with self.assertRaises(ImportError) as cm:
+            # _warning has no path as it's a built-in module.
+            from _warning import i_dont_exist
+        self.assertEqual(cm.exception.name, '_warning')
+        self.assertIsNone(cm.exception.path)
+
+    def test_from_import_missing_attr_path_is_canonical(self):
+        with self.assertRaises(ImportError) as cm:
+            from os.path import i_dont_exist
+        self.assertIn(cm.exception.name, {'posixpath', 'ntpath'})
+        self.assertIsNotNone(cm.exception)
+
     def test_case_sensitivity(self):
         # Brief digression to test that import is case-sensitive:  if we got
         # this far, we know for sure that "random" exists.
@@ -346,8 +374,11 @@ class ImportTests(unittest.TestCase):
         module_name = 'test_from_import_AttributeError'
         self.addCleanup(unload, module_name)
         sys.modules[module_name] = AlwaysAttributeError()
-        with self.assertRaises(ImportError):
+        with self.assertRaises(ImportError) as cm:
             from test_from_import_AttributeError import does_not_exist
+
+        self.assertEqual(str(cm.exception),
+            "cannot import name 'does_not_exist' from '<unknown module name>' (unknown location)")
 
 
 @skip_if_dont_write_bytecode
@@ -1136,6 +1167,12 @@ class CircularImportTests(unittest.TestCase):
             self.fail('circular import with rebinding of module attribute failed')
         from test.test_import.data.circular_imports.subpkg import util
         self.assertIs(util.util, rebinding.util)
+
+    def test_binding(self):
+        try:
+            import test.test_import.data.circular_imports.binding
+        except ImportError:
+            self.fail('circular import with binding a submodule to a name failed')
 
 
 if __name__ == '__main__':

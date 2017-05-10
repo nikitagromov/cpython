@@ -406,7 +406,7 @@ PyObject_Print(PyObject *op, FILE *fp, int flags)
     }
     if (ret == 0) {
         if (ferror(fp)) {
-            PyErr_SetFromErrno(PyExc_IOError);
+            PyErr_SetFromErrno(PyExc_OSError);
             clearerr(fp);
             ret = -1;
         }
@@ -785,7 +785,7 @@ PyObject_GetAttrString(PyObject *v, const char *name)
 
     if (Py_TYPE(v)->tp_getattr != NULL)
         return (*Py_TYPE(v)->tp_getattr)(v, (char*)name);
-    w = PyUnicode_InternFromString(name);
+    w = PyUnicode_FromString(name);
     if (w == NULL)
         return NULL;
     res = PyObject_GetAttr(v, w);

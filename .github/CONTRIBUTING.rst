@@ -6,12 +6,6 @@ Build Status
 
 - master
 
-  + .. image:: https://travis-ci.org/python/cpython.svg?branch=master
-       :target: https://travis-ci.org/python/cpython
-  
-  + .. image:: https://codecov.io/gh/python/cpython/branch/master/graph/badge.svg
-       :target: https://codecov.io/gh/python/cpython
-
   + `Stable buildbots <http://buildbot.python.org/3.x.stable/>`_
 
 - 3.6
@@ -35,10 +29,11 @@ everything from how to build the code to submitting a pull request. There are
 also suggestions on how you can most effectively help the project.
 
 Please be aware that our workflow does deviate slightly from the typical GitHub
-project. Issues are tracked at https://bugs.python.org/ and should be mentioned
-in pull requests using the format of ``bpo-12345`` . If your pull request is in
-response to a specific issue then please mention it in the title,
-e.g. “bpo-12345: fix comment in tokenizer.c”.
+project. Details on how to properly submit a pull request are covered in
+`Lifecycle of a Pull Request <https://cpython-devguide.readthedocs.io/pullrequest.html>`_.
+One key point is to keep comments on GitHub to only those related to the reviewing
+the code in the pull request. All other discussions -- e.g. about the issue being
+fixed -- should happen on bugs.python.org.
 
 If you are making a code contribution or large documentation contribution,
 please feel free to add yourself to the ``Misc/ACKS`` file alphabetically.

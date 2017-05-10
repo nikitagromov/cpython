@@ -1,20 +1,23 @@
 codecov:
   notify:
     require_ci_to_pass: true
-comment:
-  behavior: new
-  layout: header, diff
-  require_changes: false
+comment: off
+ignore:
+  - "Doc/**/*"
+  - "Misc/*"
+  - "Mac/**/*"
+  - "PC/**/*"
+  - "PCbuild/**/*"
+  - "Tools/**/*"
+  - "Grammar/*"
 coverage:
   precision: 2
-  range:
-  - 70.0
-  - 100.0
+  range: 70...90
   round: down
   status:
-    changes: false
-    patch: true
-    project: true
+    changes: off
+    project: off
+    patch: off
 parsers:
   gcov:
     branch_detection:

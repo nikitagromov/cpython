@@ -12,6 +12,31 @@ static PyObject **va_build_stack(PyObject **small_stack, Py_ssize_t small_stack_
 /* Package context -- the full module name for package imports */
 const char *_Py_PackageContext = NULL;
 
+
+int
+_Py_convert_optional_to_ssize_t(PyObject *obj, void *result)
+{
+    Py_ssize_t limit;
+    if (obj == Py_None) {
+        return 1;
+    }
+    else if (PyIndex_Check(obj)) {
+        limit = PyNumber_AsSsize_t(obj, PyExc_OverflowError);
+        if (limit == -1 && PyErr_Occurred()) {
+            return 0;
+        }
+    }
+    else {
+        PyErr_Format(PyExc_TypeError,
+                     "argument should be integer or None, not '%.200s'",
+                     Py_TYPE(obj)->tp_name);
+        return 0;
+    }
+    *((Py_ssize_t *)result) = limit;
+    return 1;
+}
+
+
 /* Helper for mkvalue() to scan the length of a format */
 
 static Py_ssize_t
@@ -585,57 +610,6 @@ va_build_stack(PyObject **small_stack, Py_ssize_t small_stack_len,
     return stack;
 }
 
-
-PyObject *
-PyEval_CallFunction(PyObject *callable, const char *format, ...)
-{
-    va_list vargs;
-    PyObject *args;
-    PyObject *res;
-
-    va_start(vargs, format);
-
-    args = Py_VaBuildValue(format, vargs);
-    va_end(vargs);
-
-    if (args == NULL)
-        return NULL;
-
-    res = PyEval_CallObject(callable, args);
-    Py_DECREF(args);
-
-    return res;
-}
-
-
-PyObject *
-PyEval_CallMethod(PyObject *obj, const char *name, const char *format, ...)
-{
-    va_list vargs;
-    PyObject *meth;
-    PyObject *args;
-    PyObject *res;
-
-    meth = PyObject_GetAttrString(obj, name);
-    if (meth == NULL)
-        return NULL;
-
-    va_start(vargs, format);
-
-    args = Py_VaBuildValue(format, vargs);
-    va_end(vargs);
-
-    if (args == NULL) {
-        Py_DECREF(meth);
-        return NULL;
-    }
-
-    res = PyEval_CallObject(meth, args);
-    Py_DECREF(meth);
-    Py_DECREF(args);
-
-    return res;
-}
 
 int
 PyModule_AddObject(PyObject *m, const char *name, PyObject *o)
